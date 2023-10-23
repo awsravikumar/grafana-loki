@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PLG Stack (Promtail, Loki, Grafana) on Amazon Linux 2 with SSM Session Manager and S3 Storage
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: The name of the S3 bucket for Loki storage
+  Region:
+    Type: String
+    Description: Region to host the EC2 instance
+
+Resources:
+  PLGSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP, HTTPS
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '3000'
+          ToPort: '3000'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '3100'
+          ToPort: '3100'
+          CidrIp: 0.0.0.0/0
+
+  LokiBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref BucketName
+
+  InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: LokiS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:DeleteObject'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - Ref: InstanceRole
+
+  PLGInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !Ref PLGSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: ami-0d406e26e5ad4de53 # Update this to the latest Amazon Linux 2 AMI ID based on your region
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y wget unzip
+
+          # Create users for Promtail, Loki, and Grafana
+          useradd promtail
+          useradd loki
+          useradd grafana
+          usermod -a -G root promtail #needed for promtail to read files /var folder
+
+          # Install and Configure Promtail
+          wget https://github.com/grafana/loki/releases/download/v2.4.1/promtail-linux-amd64.zip
+          unzip promtail-linux-amd64.zip
+          mv promtail-linux-amd64 /usr/local/bin/promtail
+          chown promtail:promtail /usr/local/bin/promtail
+
+          cat << 'EOF' | sudo tee /etc/promtail-config.yaml
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+
+          positions:
+            filename: /tmp/positions.yaml
+
+          clients:
+            - url: http://localhost:3100/loki/api/v1/push
+
+          scrape_configs:
+            - job_name: system
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: varlogs
+                    __path__: /var/log/*log
+          EOF
+
+          cat << 'EOF' > /etc/systemd/system/promtail.service
+          [Unit]
+          Description=Promtail service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=promtail
+          ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail-config.yaml
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Starting Promtail service
+          sudo systemctl daemon-reload
+          systemctl start promtail
+          systemctl enable promtail
+
+          # Install and Configure Loki with S3 backend
+          wget https://github.com/grafana/loki/releases/download/v2.9.1/loki-linux-amd64.zip
+          unzip loki-linux-amd64.zip
+          mv loki-linux-amd64 /usr/local/bin/loki
+          chown loki:loki /usr/local/bin/loki
+          # Configure Loki specific directories
+          mkdir /var/loki
+          chown loki:loki /var/loki
+
+          cat << 'EOF' | sudo tee /etc/loki-config.yaml
+          auth_enabled: false
+          server:
+            http_listen_port: 3100
+          ingester:
+            lifecycler:
+              address: 127.0.0.1
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+              final_sleep: 0s
+            chunk_idle_period: 5m
+            chunk_retain_period: 30s
+            max_transfer_retries: 0
+            wal:
+             dir: "/var/loki/wal"
+
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: boltdb-shipper
+                object_store: s3
+                schema: v11
+                index:
+                  prefix: index_loki_
+                  period: 24h
+
+          storage_config:
+            boltdb_shipper:
+              active_index_directory: /var/loki/boltdb-shipper-active
+              cache_location: /var/loki/boltdb-shipper-cache
+              cache_ttl: 24h          # Can be adjusted
+              shared_store: s3
+
+            aws:
+              s3: s3://${BucketName}  # The S3 bucket
+              s3forcepathstyle: true   # Optional based on the bucket setup
+              bucketnames: ${BucketName}
+              region: ${Region}
+
+          compactor:
+            working_directory: /var/loki/data/retention
+            compaction_interval: 10m
+            retention_enabled: true
+            retention_delete_delay: 2h
+            retention_delete_worker_count: 150
+            shared_store: s3
+
+          limits_config:
+            enforce_metric_name: false
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+
+          chunk_store_config:
+            max_look_back_period: 0s
+          EOF
+
+          cat << 'EOF' > /etc/systemd/system/loki.service
+          [Unit]
+          Description=Loki service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=loki
+          ExecStart=/usr/local/bin/loki -config.file=/etc/loki-config.yaml
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl start loki
+          sudo systemctl enable loki
+
+          # Install Grafana and Configure Loki as Datasource
+          tee /etc/yum.repos.d/grafana.repo << 'EOF'
+          [grafana]
+          name=grafana
+          baseurl=https://packages.grafana.com/oss/rpm
+          repo_gpgcheck=1
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://packages.grafana.com/gpg.key
+          sslverify=1
+          sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+          EOF
+
+          yum install grafana -y
+          chown grafana:grafana /usr/sbin/grafana-server
+
+          cat << 'EOF' | sudo tee /etc/grafana/provisioning/datasources/loki-datasource.yml
+          apiVersion: 1
+          datasources:
+          - name: Loki
+            type: loki
+            access: proxy
+            url: http://localhost:3100
+            version: 1
+          EOF
+
+          systemctl start grafana-server
+          systemctl enable grafana-server
+
+Outputs:
+  InstanceId:
+    Description: The Instance ID
+    Value: !Ref PLGInstance
+  PublicIp:
+    Description: The public IP address
+    Value: !GetAtt PLGInstance.PublicIp
+  LokiS3Bucket:
+    Description: Loki S3 storage bucket
+    Value: !Ref LokiBucket
